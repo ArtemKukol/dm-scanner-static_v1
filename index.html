@@ -58,6 +58,7 @@
         </div>
         <div id="cam-error" class="error-msg" role="alert"></div>
         <div id="lib-status" class="lib-status"></div>
+        <button id="reload-btn" class="text-btn" type="button">Обновить (сбросить кеш)</button>
       </section>
 
       <!-- Failure hint sheet -->
@@ -93,10 +94,15 @@
 
   </main>
 
-  <!-- Hidden working canvas pool used by the pipeline -->
-  <canvas id="work-canvas" hidden></canvas>
-  <canvas id="regen-canvas" hidden></canvas>
-  <canvas id="verify-canvas" hidden></canvas>
+  <!-- Off-screen working canvas pool used by the pipeline.
+       We avoid `hidden` / `display:none` — some mobile WebKit builds
+       drop the canvas backing store for non-rendered elements, which
+       silently breaks drawImage/getImageData. -->
+  <div class="offscreen-pool" aria-hidden="true">
+    <canvas id="work-canvas"></canvas>
+    <canvas id="regen-canvas"></canvas>
+    <canvas id="verify-canvas"></canvas>
+  </div>
 
   <!-- Hidden file input — triggered by gallery buttons -->
   <input id="file-input" type="file" accept="image/*" hidden />

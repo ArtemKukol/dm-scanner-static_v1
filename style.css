@@ -167,6 +167,30 @@ html, body {
 .diagnostics li { margin: 2px 0; }
 .diagnostics b  { color: #fff; font-weight: 600; }
 
+/* Plain-text mini button for "сброс кеша". Looks like a link. */
+.text-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font: 12px var(--mono);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 4px 0;
+}
+.text-btn:active { color: var(--text); }
+
+/* Off-screen canvas pool — visible to JS, never to the user. We
+ * deliberately keep these positioned (not display:none) so iOS
+ * Safari can't drop the canvas backing store. */
+.offscreen-pool {
+  position: fixed;
+  left: -9999px; top: -9999px;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+}
+
 #app[data-state="IDLE"] .welcome { display: flex; }
 #app[data-state="IDLE"] .reticle,
 #app[data-state="IDLE"] .status-bar,

@@ -60,6 +60,7 @@ const els = {
   floatingGallery: $("floating-gallery-btn"),
   fileInput:     $("file-input"),
   diagnostics:   $("diagnostics"),
+  reloadBtn:     $("reload-btn"),
   welcome:       $("welcome"),
   camError:      $("cam-error"),
   libStatus:     $("lib-status"),
@@ -1124,55 +1125,36 @@ async function closePosDisplay() {
  *   - guaranteed quiet zone (4 modules)
  *   - immediate adaptation to viewport / orientation changes
  */
+/**
+ * Render the Data Matrix directly onto the visible POS canvas.
+ * The whole function is kept dead simple:
+ *
+ *   1. Pick a fixed scale (10 / 16 px-per-module).
+ *   2. Call bwip-js.toCanvas on the *visible* dm-canvas. bwip-js sets
+ *      the backing store size itself.
+ *   3. Constrain visual size via CSS to fit the screen, with
+ *      `image-rendering: pixelated` keeping modules sharp.
+ *
+ * We also show explicit diagnostic text below the symbol so any
+ * silent failure (e.g. "encode_error: …", "canvas 0×0") is visible
+ * on the device without dev-tools.
+ */
 function renderPosCanvas() {
+  const c = els.dmCanvas;
+  const dbg = (line) => {
+    els.displayPayload.textContent = line;
+  };
+
   const payload = state.bestRegen?.payload;
-  if (!payload || !state.bwip) return;
+  if (!payload)       { dbg("Нет данных payload"); return; }
+  if (!state.bwip)    { dbg("Библиотека bwip-js не загружена"); return; }
 
   const text = payloadToBwipText(payload);
+  const scale = state.posBoost ? 16 : 10;  // px per module
+  const quietPx = 4 * scale;
 
-  // Step 1: render once at scale = 1 to learn module count.
-  const probe = els.regenCanvas;
-  probe.width = 1; probe.height = 1;
-  try {
-    state.bwip.toCanvas(probe, {
-      bcid: "datamatrix",
-      text,
-      parse: true,
-      parsefnc: true,
-      scale: 1,
-      padding: 0,
-      backgroundcolor: "FFFFFF",
-      barcolor: "000000",
-    });
-  } catch (e) {
-    console.error("probe render failed", e);
-    els.displayPayload.textContent =
-      "Не удалось отрисовать код: " + (e?.message ?? e);
-    return;
-  }
-  const modules = probe.width || 0;
-  if (modules <= 0) {
-    els.displayPayload.textContent = "Не удалось определить размер кода";
-    return;
-  }
-
-  const QUIET = 4;
-  const totalModules = modules + 2 * QUIET;
-  const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
-  const cssMin = Math.min(window.innerWidth, window.innerHeight);
-  const fillFraction = state.posBoost ? 0.96 : 0.85;
-
-  // Step 2: pick the largest integer pixels-per-module that still fits.
-  // Minimum 8 device px / module — that is the rule of thumb for
-  // imaging POS scanners reading from a phone screen.
-  const targetDev = cssMin * dpr * fillFraction;
-  const scale = Math.max(8, Math.floor(targetDev / totalModules));
-  const sideDev = totalModules * scale;
-  const sideCss = sideDev / dpr;
-
-  // Step 3: re-render onto the VISIBLE canvas, with bwip-js doing the
-  // quiet zone itself via paddingwidth/paddingheight (in pixels).
-  const c = els.dmCanvas;
+  // Reset to 1×1 so a silent bwip-js failure is detectable.
+  c.width = 1; c.height = 1;
   try {
     state.bwip.toCanvas(c, {
       bcid: "datamatrix",
@@ -1180,26 +1162,38 @@ function renderPosCanvas() {
       parse: true,
       parsefnc: true,
       scale,
-      paddingwidth: QUIET * scale,
-      paddingheight: QUIET * scale,
+      paddingwidth: quietPx,
+      paddingheight: quietPx,
       backgroundcolor: state.posInverted ? "000000" : "FFFFFF",
       barcolor:        state.posInverted ? "FFFFFF" : "000000",
     });
   } catch (e) {
-    console.error("final render failed", e);
-    els.displayPayload.textContent =
-      "Ошибка рендера: " + (e?.message ?? e);
+    console.error("bwipjs.toCanvas failed", e);
+    dbg("Ошибка рендера: " + (e?.message ?? e));
     return;
   }
 
-  // Lock CSS size — bwip-js sets backing-store width/height; we keep
-  // each backing-store pixel at exactly `dpr` device pixels.
-  c.style.width  = `${sideCss}px`;
-  c.style.height = `${sideCss}px`;
-  c.style.maxWidth = "100%";
-  c.style.maxHeight = "75vh";
+  if (c.width <= 1 || c.height <= 1) {
+    dbg(`bwip-js вернул пустой холст (${c.width}×${c.height})`);
+    return;
+  }
 
-  els.displayPayload.textContent = state.bestRegen.payloadUtf8 ?? "";
+  // Visual sizing: fit short edge of viewport, keep aspect square.
+  const cssMin = Math.min(window.innerWidth, window.innerHeight);
+  const fillFraction = state.posBoost ? 0.96 : 0.85;
+  const cssSide = Math.floor(cssMin * fillFraction);
+  c.style.width  = `${cssSide}px`;
+  c.style.height = `${cssSide}px`;
+  c.style.maxWidth  = "100%";
+  c.style.maxHeight = "70dvh";
+  c.style.display = "block";
+  c.style.imageRendering = "pixelated";
+
+  // Always show first 80 chars of payload + actual canvas size; a
+  // black canvas with this text means the bitmap was drawn but the
+  // page isn't displaying it — useful field diagnostic.
+  const head = (state.bestRegen.payloadUtf8 ?? "—").slice(0, 80);
+  els.displayPayload.textContent = `${head}   [${c.width}×${c.height}px]`;
 }
 
 window.addEventListener("resize", () => {
@@ -1268,12 +1262,55 @@ els.invertBtn.addEventListener("click", () => {
   renderPosCanvas();
 });
 
+// ── Manual cache reset (for stale-SW situations) -------------
+els.reloadBtn?.addEventListener("click", async () => {
+  els.reloadBtn.disabled = true;
+  els.libStatus.textContent = "Сброс кеша…";
+  try {
+    if ("serviceWorker" in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+    if ("caches" in self) {
+      const names = await caches.keys();
+      await Promise.all(names.map((n) => caches.delete(n)));
+    }
+  } catch (e) {
+    console.warn("cache reset failed", e);
+  } finally {
+    // Hard-reload bypassing HTTP cache where supported.
+    location.reload();
+  }
+});
+
 // ── Service worker registration ------------------------------
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker
-      .register(new URL("./sw.js", import.meta.url))
-      .catch((e) => console.warn("SW register failed", e));
+  window.addEventListener("load", async () => {
+    try {
+      const reg = await navigator.serviceWorker.register(
+        new URL("./sw.js", import.meta.url)
+      );
+      // On controller change (new SW activated mid-session), reload
+      // the page so the user gets the new build automatically.
+      let reloaded = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloaded) return;
+        reloaded = true;
+        location.reload();
+      });
+      // Force-check for an update — useful if the user just deployed
+      // a new build and is reloading on top of an old controller.
+      reg.update().catch(() => undefined);
+    } catch (e) {
+      console.warn("SW register failed", e);
+    }
+  });
+  // The SW posts {type:"sw-activated"} after activation. If we get it,
+  // a controllerchange will follow and reload us.
+  navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (ev.data?.type === "sw-activated") {
+      console.info("SW activated:", ev.data.version);
+    }
   });
 }
 

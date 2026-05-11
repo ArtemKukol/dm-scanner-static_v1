@@ -1,18 +1,15 @@
 /* Service worker.
  *
- * Two caches:
- *   shell-vN  — local files (HTML/CSS/JS/manifest), pre-cached at install.
- *   cdn-vN    — third-party ESM modules (zxing-wasm, bwip-js) and the
- *               WASM binary they fetch lazily. Stale-while-revalidate.
- *
  * Strategy:
- *   - Same-origin GET → cache-first, network fallback.
- *   - esm.sh / unpkg.com / cdn.jsdelivr.net GET → stale-while-revalidate.
- *   - Everything else → network passthrough (camera APIs are not
- *     fetches; this never touches them).
+ *   Same-origin (HTML / CSS / our JS):   NETWORK-FIRST with cache fallback.
+ *     → Every refresh online sees the freshest build. Cache only acts
+ *       as offline-resilience. This stops new deployments from being
+ *       hidden by a stale cache.
+ *   CDN-hosted libraries (zxing-wasm, bwip-js, transitive .wasm):
+ *     stale-while-revalidate — fast first paint, updates on next refresh.
  */
 
-const VERSION = "v2";
+const VERSION = "v3";
 const SHELL_CACHE = `dm-scanner-shell-${VERSION}`;
 const CDN_CACHE   = `dm-scanner-cdn-${VERSION}`;
 
@@ -25,8 +22,6 @@ const SHELL_FILES = [
   "./manifest.json",
 ];
 
-/* Domains whose responses we cache (covers all fallback CDNs the app
- * may dynamically import from, including transitive .wasm fetches). */
 const CDN_HOSTS = new Set([
   "esm.sh",
   "cdn.esm.sh",
@@ -35,23 +30,24 @@ const CDN_HOSTS = new Set([
 ]);
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches
-      .open(SHELL_CACHE)
-      .then((c) => c.addAll(SHELL_FILES))
-      .then(() => self.skipWaiting())
-  );
+  event.waitUntil((async () => {
+    const cache = await caches.open(SHELL_CACHE);
+    // Best-effort pre-cache — failures here don't block install.
+    await cache.addAll(SHELL_FILES).catch(() => undefined);
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    (async () => {
-      const keep = new Set([SHELL_CACHE, CDN_CACHE]);
-      const names = await caches.keys();
-      await Promise.all(names.filter((n) => !keep.has(n)).map((n) => caches.delete(n)));
-      await self.clients.claim();
-    })()
-  );
+  event.waitUntil((async () => {
+    const keep = new Set([SHELL_CACHE, CDN_CACHE]);
+    const names = await caches.keys();
+    await Promise.all(names.filter((n) => !keep.has(n)).map((n) => caches.delete(n)));
+    await self.clients.claim();
+    // Tell any open tab it should reload to pick up the new shell.
+    const clients = await self.clients.matchAll({ type: "window" });
+    for (const c of clients) c.postMessage({ type: "sw-activated", version: VERSION });
+  })());
 });
 
 self.addEventListener("fetch", (event) => {
@@ -59,36 +55,31 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
 
   const url = new URL(req.url);
-  const sameOrigin = url.origin === self.location.origin;
-
-  if (sameOrigin) {
-    event.respondWith(cacheFirst(req, SHELL_CACHE));
+  if (url.origin === self.location.origin) {
+    event.respondWith(networkFirst(req, SHELL_CACHE));
     return;
   }
-
   if (CDN_HOSTS.has(url.host)) {
     event.respondWith(staleWhileRevalidate(req, CDN_CACHE));
     return;
   }
-  // Other origins (none expected): just passthrough.
+  // Other origins (none expected) — passthrough.
 });
 
-async function cacheFirst(req, cacheName) {
+async function networkFirst(req, cacheName) {
   const cache = await caches.open(cacheName);
-  const hit = await cache.match(req, { ignoreSearch: false });
-  if (hit) return hit;
   try {
-    const res = await fetch(req);
-    if (res.ok) cache.put(req, res.clone());
+    const res = await fetch(req, { cache: "no-store" });
+    if (res && res.ok) cache.put(req, res.clone()).catch(() => undefined);
     return res;
-  } catch (e) {
-    // Last-resort fallback: serve the shell index when offline and
-    // a navigation request misses cache (e.g. deep-link).
+  } catch (_err) {
+    const hit = await cache.match(req, { ignoreSearch: false });
+    if (hit) return hit;
     if (req.mode === "navigate") {
       const shell = await cache.match("./index.html");
       if (shell) return shell;
     }
-    throw e;
+    return Response.error();
   }
 }
 
@@ -97,7 +88,7 @@ async function staleWhileRevalidate(req, cacheName) {
   const cached = await cache.match(req);
   const network = fetch(req)
     .then((res) => {
-      if (res && res.ok) cache.put(req, res.clone());
+      if (res && res.ok) cache.put(req, res.clone()).catch(() => undefined);
       return res;
     })
     .catch(() => undefined);
@@ -106,5 +97,13 @@ async function staleWhileRevalidate(req, cacheName) {
 
 // Manual cache-bust hook from the page.
 self.addEventListener("message", (event) => {
-  if (event.data?.type === "skipWaiting") self.skipWaiting();
+  const msg = event.data;
+  if (!msg) return;
+  if (msg.type === "skipWaiting") self.skipWaiting();
+  if (msg.type === "purge") {
+    event.waitUntil((async () => {
+      const names = await caches.keys();
+      await Promise.all(names.map((n) => caches.delete(n)));
+    })());
+  }
 });
