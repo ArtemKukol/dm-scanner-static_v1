@@ -779,19 +779,34 @@ function payloadToBwipText(bytes) {
   return s;
 }
 
+/**
+ * Verify that we can re-encode `bytes` as a Data Matrix that round-trips
+ * (decoded by ZXing → byte-identical to `bytes`). We do NOT keep the
+ * rendered canvas — the display step re-renders directly onto the
+ * visible POS canvas to avoid any cross-canvas drawImage issues.
+ */
 async function regenerate(bytes) {
   if (!state.bwip) throw new Error("bwip not loaded");
   const c = els.regenCanvas;
+  c.width = 1; c.height = 1; // reset to detect silent failures
   const text = payloadToBwipText(bytes);
-  state.bwip.toCanvas(c, {
-    bcid: "datamatrix",
-    text,
-    parsefnc: true,
-    scale: 8,
-    padding: 0,
-    backgroundcolor: "FFFFFF",
-    barcolor: "000000",
-  });
+  try {
+    state.bwip.toCanvas(c, {
+      bcid: "datamatrix",
+      text,
+      parse: true,
+      parsefnc: true,
+      scale: 8,
+      padding: 0,
+      backgroundcolor: "FFFFFF",
+      barcolor: "000000",
+    });
+  } catch (e) {
+    return { ok: false, reason: "encode_error: " + (e?.message ?? e) };
+  }
+  if (c.width <= 1 || c.height <= 1) {
+    return { ok: false, reason: "encode_empty_canvas" };
+  }
 
   // round-trip verify by re-decoding the rendered canvas
   const verifyResults = await state.zxing.readBarcodes(c, {
@@ -808,7 +823,7 @@ async function regenerate(bytes) {
   if (!bytesEqual(got, bytes)) {
     return { ok: false, reason: "regen_mismatch" };
   }
-  return { ok: true, canvas: c };
+  return { ok: true };
 }
 
 function bytesEqual(a, b) {
@@ -905,7 +920,7 @@ async function processFrame(triagedRes) {
     durationMs: dt | 0,
     framesAgree: hits,
   };
-  state.bestRegen = { canvas: regen.canvas, payloadUtf8: tryUtf8(decoded.bytes) };
+  state.bestRegen = { payload: decoded.bytes, payloadUtf8: tryUtf8(decoded.bytes) };
   showSuccess();
 }
 
@@ -1060,7 +1075,7 @@ async function processStillImage(file) {
     durationMs: dt | 0,
     framesAgree: 1,
   };
-  state.bestRegen = { canvas: regen.canvas, payloadUtf8: tryUtf8(decoded.bytes) };
+  state.bestRegen = { payload: decoded.bytes, payloadUtf8: tryUtf8(decoded.bytes) };
   showSuccess();
 }
 
@@ -1096,41 +1111,94 @@ async function closePosDisplay() {
   setState("SCANNING");
 }
 
+/**
+ * Render the Data Matrix directly onto the visible POS canvas via
+ * bwip-js. We don't drawImage from the hidden regen canvas: that path
+ * was producing a blank result on some browsers (likely because the
+ * source canvas was `display:none` or its backing store had been
+ * invalidated by an intervening `getImageData` call from the ZXing
+ * verify step). Rendering fresh each time also gives us:
+ *
+ *   - pixel-perfect integer module size (≥ 8 device px / module)
+ *   - clean black-on-white (or inverted) with no anti-aliasing
+ *   - guaranteed quiet zone (4 modules)
+ *   - immediate adaptation to viewport / orientation changes
+ */
 function renderPosCanvas() {
-  const src = state.bestRegen?.canvas;
-  if (!src) return;
-  const dpr = window.devicePixelRatio || 1;
-  const cssMin = Math.min(window.innerWidth, window.innerHeight);
-  const targetCss = Math.floor(cssMin * (state.posBoost ? 0.96 : 0.85));
+  const payload = state.bestRegen?.payload;
+  if (!payload || !state.bwip) return;
 
-  // bwip-js renders at scale=8 px-per-module by default; src.width is
-  // (modules + 2*quietZone) * scale. We re-snap so each *src* pixel
-  // is an integer number of *device* pixels — that avoids any
-  // fractional scaling on the screen.
-  const srcSide = src.width;
-  const minDevPxPerSrcPx = state.posBoost ? 2 : 1;
-  const factor = Math.max(minDevPxPerSrcPx, Math.floor((targetCss * dpr) / srcSide));
-  const sideDev = srcSide * factor;
+  const text = payloadToBwipText(payload);
+
+  // Step 1: render once at scale = 1 to learn module count.
+  const probe = els.regenCanvas;
+  probe.width = 1; probe.height = 1;
+  try {
+    state.bwip.toCanvas(probe, {
+      bcid: "datamatrix",
+      text,
+      parse: true,
+      parsefnc: true,
+      scale: 1,
+      padding: 0,
+      backgroundcolor: "FFFFFF",
+      barcolor: "000000",
+    });
+  } catch (e) {
+    console.error("probe render failed", e);
+    els.displayPayload.textContent =
+      "Не удалось отрисовать код: " + (e?.message ?? e);
+    return;
+  }
+  const modules = probe.width || 0;
+  if (modules <= 0) {
+    els.displayPayload.textContent = "Не удалось определить размер кода";
+    return;
+  }
+
+  const QUIET = 4;
+  const totalModules = modules + 2 * QUIET;
+  const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
+  const cssMin = Math.min(window.innerWidth, window.innerHeight);
+  const fillFraction = state.posBoost ? 0.96 : 0.85;
+
+  // Step 2: pick the largest integer pixels-per-module that still fits.
+  // Minimum 8 device px / module — that is the rule of thumb for
+  // imaging POS scanners reading from a phone screen.
+  const targetDev = cssMin * dpr * fillFraction;
+  const scale = Math.max(8, Math.floor(targetDev / totalModules));
+  const sideDev = totalModules * scale;
   const sideCss = sideDev / dpr;
 
+  // Step 3: re-render onto the VISIBLE canvas, with bwip-js doing the
+  // quiet zone itself via paddingwidth/paddingheight (in pixels).
   const c = els.dmCanvas;
-  c.width = sideDev; c.height = sideDev;
+  try {
+    state.bwip.toCanvas(c, {
+      bcid: "datamatrix",
+      text,
+      parse: true,
+      parsefnc: true,
+      scale,
+      paddingwidth: QUIET * scale,
+      paddingheight: QUIET * scale,
+      backgroundcolor: state.posInverted ? "000000" : "FFFFFF",
+      barcolor:        state.posInverted ? "FFFFFF" : "000000",
+    });
+  } catch (e) {
+    console.error("final render failed", e);
+    els.displayPayload.textContent =
+      "Ошибка рендера: " + (e?.message ?? e);
+    return;
+  }
+
+  // Lock CSS size — bwip-js sets backing-store width/height; we keep
+  // each backing-store pixel at exactly `dpr` device pixels.
   c.style.width  = `${sideCss}px`;
   c.style.height = `${sideCss}px`;
+  c.style.maxWidth = "100%";
+  c.style.maxHeight = "75vh";
 
-  const ctx = c.getContext("2d");
-  ctx.imageSmoothingEnabled = false;
-  ctx.fillStyle = state.posInverted ? "#000000" : "#FFFFFF";
-  ctx.fillRect(0, 0, sideDev, sideDev);
-  ctx.drawImage(src, 0, 0, srcSide, srcSide, 0, 0, sideDev, sideDev);
-  if (state.posInverted) {
-    const img = ctx.getImageData(0, 0, sideDev, sideDev);
-    const d = img.data;
-    for (let i = 0; i < d.length; i += 4) {
-      d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
-    }
-    ctx.putImageData(img, 0, 0);
-  }
   els.displayPayload.textContent = state.bestRegen.payloadUtf8 ?? "";
 }
 
